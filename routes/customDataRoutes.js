@@ -1,0 +1,20 @@
+const express = require('express');
+const router = express.Router();
+const multer = require('multer');
+const upload = multer({ storage: multer.memoryStorage() });
+const { authenticate } = require('../middlewares/auth');
+const customDataController = require('../controllers/customDataController');
+
+router.get('/', authenticate, customDataController.list);
+router.post('/', authenticate, customDataController.create);
+router.put('/:id', authenticate, customDataController.update);
+router.post('/bulk-delete', authenticate, customDataController.bulkDelete);
+router.get('/rules', authenticate, customDataController.listSkuRules);
+router.post('/rules', authenticate, customDataController.saveSkuRule);
+router.delete('/rules/:id', authenticate, customDataController.deleteSkuRule);
+router.post('/upload-csv', authenticate, upload.single('file'), customDataController.uploadCsv);
+router.get('/export-csv', authenticate, customDataController.exportCsv);
+router.post('/process-orders', authenticate, customDataController.processAllOrders);
+
+module.exports = router;
+
