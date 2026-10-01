@@ -212,14 +212,31 @@ async function parseAmazonCustomizationZip(customizedUrl, originalSku = null, co
 
       const optionValues = [];
 
+      const addOption = (val, qty = 1) => {
+        if (!val) return;
+        const q = Math.max(1, parseInt(qty || 1, 10));
+        for (let k = 0; k < q; k++) {
+          optionValues.push(String(val).trim());
+        }
+      };
+
       for (const surface of surfaces) {
         const areas = surface.areas || [];
         for (const area of areas) {
-          if (area.customizationType === 'Options' || area.optionValue || area.optionName) {
-            const optVal = area.optionValue || area.optionName || area.value || area.label || area.text;
-            if (optVal) {
-              optionValues.push(String(optVal).trim());
-            }
+          const qty = area.quantity || area.qty || 1;
+          if (Array.isArray(area.optionValues)) {
+            area.optionValues.forEach(ov => addOption(ov, qty));
+          }
+          if (Array.isArray(area.options)) {
+            area.options.forEach(opt => {
+              const optVal = opt?.optionValue || opt?.value || opt?.name || opt?.label;
+              const optQty = opt?.quantity || opt?.qty || qty;
+              addOption(optVal, optQty);
+            });
+          }
+          const optVal = area.optionValue || area.optionName || area.value || area.label || area.text;
+          if (optVal && (!Array.isArray(area.optionValues) || area.optionValues.length === 0)) {
+            addOption(optVal, qty);
           }
         }
       }
@@ -229,11 +246,12 @@ async function parseAmazonCustomizationZip(customizedUrl, originalSku = null, co
         const children = cData.children || [];
         for (const ch of children) {
           const opt = ch.optionValue || ch.optionName || ch.inputValue || ch.value;
-          if (opt) optionValues.push(String(opt).trim());
+          const qty = ch.quantity || ch.qty || 1;
+          if (opt) addOption(opt, qty);
         }
       }
 
-      // 3. Match each selected option in-memory
+      // 3. Match each selected option in-memory with strict tiered priority
       for (const optionValue of optionValues) {
         if (!optionValue || optionValue === 'DISP_No_thx') continue;
 
@@ -242,20 +260,27 @@ async function parseAmazonCustomizationZip(customizedUrl, originalSku = null, co
         const origClean = String(originalSku || '').trim().toLowerCase();
 
         // Match priority:
-        // 1. ASIN + optionValue (Zoltan Python primary)
-        // 2. originalSku + optionValue
-        // 3. optionValue alone
-        let mapping = allMappings.find(m => {
-          const mOpt = String(m.optionValue || '').trim().toLowerCase();
-          const mAsin = String(m.asin || '').trim().toLowerCase();
-          const mOrig = String(m.originalSku || '').trim().toLowerCase();
-
-          return (
-            (asinClean && mAsin === asinClean && mOpt === optClean) ||
-            (origClean && mOrig === origClean && mOpt === optClean) ||
-            (mOpt === optClean)
+        // Tier 1: ASIN + optionValue (Zoltan Python primary)
+        let mapping = null;
+        if (asinClean) {
+          mapping = allMappings.find(m => 
+            String(m.asin || '').trim().toLowerCase() === asinClean &&
+            String(m.optionValue || '').trim().toLowerCase() === optClean
           );
-        });
+        }
+        // Tier 2: originalSku + optionValue
+        if (!mapping && origClean) {
+          mapping = allMappings.find(m => 
+            String(m.originalSku || '').trim().toLowerCase() === origClean &&
+            String(m.optionValue || '').trim().toLowerCase() === optClean
+          );
+        }
+        // Tier 3: optionValue alone
+        if (!mapping) {
+          mapping = allMappings.find(m => 
+            String(m.optionValue || '').trim().toLowerCase() === optClean
+          );
+        }
 
         // If not found in DB, auto-capture mapping entry asynchronously
         if (!mapping) {
@@ -324,10 +349,15 @@ async function processOrderCustomizations(salesOrderIdOrOrder, preloadedMappings
     allMappings = await CustomizationMapping.findAll({ where: { companyId: compId } });
   }
 
+  const processedItemIds = new Set();
+  const processedParentSkus = new Set();
+
   for (const item of order.OrderItems) {
+    if (processedItemIds.has(item.id)) continue;
+
     const rawSku = (item.originalSku || (item.Product ? item.Product.sku : item.sku) || '').trim();
 
-    // Detect customized URL comprehensively across all possible fields
+    // Skip if this rawSku was already expanded in this order and item has no independent customizedUrl
     let customUrl = item.customizedUrl || null;
     if (!customUrl) {
       customUrl = extractCustomizedUrl(item.customizedUrl) ||
@@ -341,6 +371,10 @@ async function processOrderCustomizations(salesOrderIdOrOrder, preloadedMappings
                   extractCustomizedUrl(order.giftNote);
     }
 
+    if (processedParentSkus.has(rawSku) && !item.customizedUrl) {
+      continue;
+    }
+
     // Parse ZIP / Custom data using Zoltan's Python logic
     let matches = [];
     if (customUrl) {
@@ -350,23 +384,27 @@ async function processOrderCustomizations(salesOrderIdOrOrder, preloadedMappings
     // Direct mapping fallback by originalSku (e.g. SF_3, NA_M_12) if URL download wasn't needed or available
     if ((!matches || matches.length === 0) && rawSku) {
       const cleanRaw = rawSku.toLowerCase();
-      const directMatch = allMappings.find(m => 
+      const directMatches = allMappings.filter(m => 
         String(m.originalSku || '').trim().toLowerCase() === cleanRaw &&
         m.processedSku && 
         m.processedSku !== 'PENDING_SKU'
       );
-      if (directMatch) {
-        matches = [{
-          asin: directMatch.asin,
-          optionValue: directMatch.optionValue,
-          processedSku: directMatch.processedSku.trim()
-        }];
+      if (directMatches && directMatches.length > 0) {
+        matches = directMatches.map(dm => ({
+          asin: dm.asin,
+          optionValue: dm.optionValue,
+          processedSku: dm.processedSku.trim(),
+          outOfStock: dm.outOfStock,
+          costPrice: dm.costPrice
+        }));
       }
     }
 
     if (matches && matches.length > 0) {
       const validMatches = matches.filter(m => m && m.processedSku && m.processedSku !== 'DISP_No_thx');
       if (validMatches.length === 0) continue;
+
+      if (rawSku) processedParentSkus.add(rawSku);
 
       // 1. Check expected count rule for parent SKU
       let expectedCount = null;
@@ -393,7 +431,7 @@ async function processOrderCustomizations(salesOrderIdOrOrder, preloadedMappings
           if (rule) {
             expectedCount = rule.expectedCount;
           } else {
-            const numMatch = rawSku.match(/_(\d+)$/);
+            const numMatch = rawSku.match(/(?:^|[_-])(\d+)(?:[_-]|$)/);
             if (numMatch) {
               expectedCount = parseInt(numMatch[1], 10);
             }
@@ -405,7 +443,6 @@ async function processOrderCustomizations(salesOrderIdOrOrder, preloadedMappings
       const totalExpected = expectedCount ? expectedCount * orderQty : null;
 
       // Determine quantity per matched item:
-      // If customer selected 4 options for a 4-pack but ordered 2 packs (qty=2), each item gets qty=2.
       let perMatchQty = 1;
       if (expectedCount && validMatches.length === expectedCount && orderQty > 1) {
         perMatchQty = orderQty;
@@ -444,38 +481,58 @@ async function processOrderCustomizations(salesOrderIdOrOrder, preloadedMappings
         customizedUrl: customUrl || item.customizedUrl,
         name: p0 ? p0.name : item.name
       });
+      processedItemIds.add(item.id);
 
-      // 4. Create sibling OrderItems for remaining matches (matches 2..N) if not already present
-      if (validMatches.length > 1) {
-        const existingSiblings = await OrderItem.findAll({
-          where: {
+      // 4. Synchronize sibling OrderItems for remaining matches (matches 1..N-1)
+      const existingSiblings = await OrderItem.findAll({
+        where: {
+          salesOrderId: order.id,
+          originalSku: rawSku,
+          id: { [Op.ne]: item.id }
+        },
+        order: [['id', 'ASC']]
+      });
+
+      const remainingMatches = validMatches.slice(1);
+      for (let mIdx = 0; mIdx < remainingMatches.length; mIdx++) {
+        const m = remainingMatches[mIdx];
+        const pm = await getOrCreateProduct(m.processedSku, m.optionValue);
+        const existingSibling = existingSiblings[mIdx];
+
+        if (existingSibling) {
+          await existingSibling.update({
+            productId: pm ? pm.id : existingSibling.productId,
+            quantity: perMatchQty,
+            batchNumber: m.optionValue || existingSibling.batchNumber,
+            customizedUrl: customUrl || existingSibling.customizedUrl,
+            name: pm ? pm.name : (existingSibling.name || `${m.processedSku} (Custom Product)`)
+          });
+          processedItemIds.add(existingSibling.id);
+        } else {
+          const newSibling = await OrderItem.create({
             salesOrderId: order.id,
+            productId: pm ? pm.id : null,
+            quantity: perMatchQty,
+            unitPrice: 0,
+            netPrice: 0,
+            grossPrice: 0,
+            vatRate: 0,
+            vatAmount: 0,
+            warehouseId: item.warehouseId,
+            locationId: item.locationId,
+            batchNumber: m.optionValue || null,
             originalSku: rawSku,
-            id: { [Op.ne]: item.id }
-          }
-        });
+            customizedUrl: customUrl || item.customizedUrl,
+            name: pm ? pm.name : `${m.processedSku} (Custom Product)`
+          });
+          processedItemIds.add(newSibling.id);
+        }
+      }
 
-        if (existingSiblings.length === 0) {
-          for (let mIdx = 1; mIdx < validMatches.length; mIdx++) {
-            const m = validMatches[mIdx];
-            const pm = await getOrCreateProduct(m.processedSku, m.optionValue);
-            await OrderItem.create({
-              salesOrderId: order.id,
-              productId: pm ? pm.id : null,
-              quantity: perMatchQty,
-              unitPrice: 0,
-              netPrice: 0,
-              grossPrice: 0,
-              vatRate: 0,
-              vatAmount: 0,
-              warehouseId: item.warehouseId,
-              locationId: item.locationId,
-              batchNumber: m.optionValue || null,
-              originalSku: rawSku,
-              customizedUrl: customUrl || item.customizedUrl,
-              name: pm ? pm.name : `${m.processedSku} (Custom Product)`
-            });
-          }
+      // If there are more old siblings than matches, clean up extras
+      if (existingSiblings.length > remainingMatches.length) {
+        for (let sIdx = remainingMatches.length; sIdx < existingSiblings.length; sIdx++) {
+          await existingSiblings[sIdx].destroy().catch(() => {});
         }
       }
 
