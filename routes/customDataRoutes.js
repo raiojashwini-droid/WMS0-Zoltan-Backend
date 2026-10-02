@@ -8,6 +8,7 @@ const customDataController = require('../controllers/customDataController');
 router.get('/', authenticate, customDataController.list);
 router.post('/', authenticate, customDataController.create);
 router.put('/:id', authenticate, customDataController.update);
+router.delete('/:id', authenticate, customDataController.remove);
 router.post('/bulk-delete', authenticate, customDataController.bulkDelete);
 router.get('/rules', authenticate, customDataController.listSkuRules);
 router.post('/rules', authenticate, customDataController.saveSkuRule);
